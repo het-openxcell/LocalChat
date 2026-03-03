@@ -1,0 +1,23 @@
+[package]
+name = "localchat"
+version = "2.0.0"
+edition = "2021"
+description = "Encrypted P2P terminal chat — LAN messenger with E2E encryption"
+
+[[bin]]
+name = "localchat"
+path = "src/main.rs"
+
+[dependencies]
+# Encryption — X25519 key exchange + ChaCha20-Poly1305 AEAD
+x25519-dalek = "2"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+
+# Terminal UI
+ratatui = "0.26"
+crossterm = "0.27"
+
+# Timestamps and history
+chrono = "0.4"
