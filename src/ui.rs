@@ -14,14 +14,13 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use std::{io, net::TcpStream, sync::mpsc, time::Duration};
+use std::{io, sync::mpsc, time::Duration};
 
 use chrono::Local;
 
-use crate::crypto::CryptoSession;
 use crate::history::HistoryWriter;
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// ─── Public types ─────────────────────────────────────────────────────────────
 
 pub struct ChatMessage {
     pub timestamp: String,
@@ -32,10 +31,21 @@ pub struct ChatMessage {
 }
 
 pub enum AppEvent {
+    /// A chat message arrived from a peer.
     Message(ChatMessage),
+    /// The other side sent /quit (graceful disconnect).
     PeerLeft,
+    /// Network error.
     ConnectionLost,
+    /// A user joined the room (multi-user).
+    UserJoined(String),
+    /// A user left the room (multi-user).
+    UserLeft(String),
+    /// Initial room membership (sent once on connect).
+    RoomInfo(Vec<String>),
 }
+
+// ─── App state ────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
 enum Status {
@@ -45,38 +55,36 @@ enum Status {
     Quit,
 }
 
-// ─── App state ───────────────────────────────────────────────────────────────
-
 struct App {
     messages: Vec<ChatMessage>,
     input: String,
     cursor_pos: usize,
-    /// Number of messages from the bottom to skip when rendering (0 = latest).
+    /// How many messages from the bottom to hide (0 = always show latest).
     scroll_offset: usize,
     my_name: String,
-    peer_name: String,
+    /// "Alice" in 1-on-1, "Chat Room" when hosting.
+    room_label: String,
+    /// Sorted list of users currently online (including self).
+    online_users: Vec<String>,
     status: Status,
 }
 
 impl App {
-    fn new(my_name: String, peer_name: String) -> Self {
+    fn new(my_name: String, room_label: String) -> Self {
         Self {
             messages: Vec::new(),
             input: String::new(),
             cursor_pos: 0,
             scroll_offset: 0,
+            online_users: vec![my_name.clone()],
             my_name,
-            peer_name,
+            room_label,
             status: Status::Connected,
         }
     }
 
     fn push(&mut self, msg: ChatMessage) {
         self.messages.push(msg);
-        // Keep auto-scroll unless user has scrolled up
-        if self.scroll_offset == 0 {
-            // Nothing to adjust — render will show latest
-        }
     }
 
     fn scroll_up(&mut self, n: usize) {
@@ -86,16 +94,39 @@ impl App {
     fn scroll_down(&mut self, n: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(n);
     }
+
+    fn set_online(&mut self, mut users: Vec<String>) {
+        if !users.contains(&self.my_name) {
+            users.push(self.my_name.clone());
+        }
+        users.sort_unstable();
+        self.online_users = users;
+    }
+
+    fn user_join(&mut self, name: String) {
+        if !self.online_users.contains(&name) {
+            self.online_users.push(name);
+            self.online_users.sort_unstable();
+        }
+    }
+
+    fn user_leave(&mut self, name: &str) {
+        self.online_users.retain(|n| n != name);
+    }
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+/// Launch the chat UI.
+///
+/// * `send_tx`    – send a message text (UI → transport); send "/quit" to disconnect.
+/// * `event_rx`   – receive events from the transport layer (messages, join/leave, …).
+/// * `room_label` – displayed in the header. Peer's name in 1-on-1, "Chat Room" in multi-user.
 pub fn run_ui(
-    stream: TcpStream,
-    crypto: CryptoSession,
+    send_tx: mpsc::Sender<String>,
     event_rx: mpsc::Receiver<AppEvent>,
     my_name: String,
-    peer_name: String,
+    room_label: String,
     mut history: Option<HistoryWriter>,
 ) -> io::Result<()> {
     // Restore terminal on panic
@@ -113,16 +144,22 @@ pub fn run_ui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(my_name, peer_name.clone());
+    let mut app = App::new(my_name.clone(), room_label.clone());
     app.push(system_msg(format!(
-        "🔒  End-to-end encrypted session with {}  started.",
-        peer_name
+        "🔒  End-to-end encrypted.  Connected to: {}",
+        room_label
     )));
     app.push(system_msg(
         "PageUp/PageDown to scroll  ·  /quit or Esc to exit".to_string(),
     ));
 
-    let result = event_loop(&mut terminal, &mut app, stream, &crypto, &event_rx, &mut history);
+    let result = event_loop(
+        &mut terminal,
+        &mut app,
+        &send_tx,
+        &event_rx,
+        &mut history,
+    );
 
     // Restore terminal
     disable_raw_mode()?;
@@ -133,7 +170,6 @@ pub fn run_ui(
     )?;
     terminal.show_cursor()?;
 
-    // Remove custom panic hook
     let _ = std::panic::take_hook();
 
     if let Some(h) = history.as_mut() {
@@ -143,18 +179,17 @@ pub fn run_ui(
     result
 }
 
-// ─── Event loop ──────────────────────────────────────────────────────────────
+// ─── Event loop ───────────────────────────────────────────────────────────────
 
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    mut stream: TcpStream,
-    crypto: &CryptoSession,
+    send_tx: &mpsc::Sender<String>,
     event_rx: &mpsc::Receiver<AppEvent>,
     history: &mut Option<HistoryWriter>,
 ) -> io::Result<()> {
     loop {
-        // Drain network events
+        // ── Drain incoming events ─────────────────────────────────────────────
         while let Ok(evt) = event_rx.try_recv() {
             match evt {
                 AppEvent::Message(msg) => {
@@ -165,22 +200,31 @@ fn event_loop(
                     app.push(msg);
                 }
                 AppEvent::PeerLeft => {
-                    app.push(system_msg(format!(
-                        "{} has left the chat.",
-                        app.peer_name
-                    )));
+                    app.push(system_msg("The other side disconnected.".to_string()));
                     app.status = Status::PeerLeft;
                 }
                 AppEvent::ConnectionLost => {
                     app.push(system_msg("Connection lost.".to_string()));
                     app.status = Status::ConnectionLost;
                 }
+                AppEvent::UserJoined(name) => {
+                    send_desktop_notification("LocalChat", &format!("{} joined", name));
+                    app.push(system_msg(format!("{} joined the room.", name)));
+                    app.user_join(name);
+                }
+                AppEvent::UserLeft(name) => {
+                    app.push(system_msg(format!("{} left the room.", name)));
+                    app.user_leave(&name);
+                }
+                AppEvent::RoomInfo(names) => {
+                    app.set_online(names);
+                }
             }
         }
 
         terminal.draw(|f| render(f, app))?;
 
-        // After disconnect: wait for any key then exit
+        // ── Disconnected: wait for any key then exit ───────────────────────────
         if app.status != Status::Connected {
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(_) = event::read()? {
@@ -194,50 +238,50 @@ fn event_loop(
             continue;
         }
 
+        // ── Keyboard input ────────────────────────────────────────────────────
         if let Event::Key(key) = event::read()? {
             match key.code {
-                // ── Send ──────────────────────────────────────────────
                 KeyCode::Enter => {
                     let text = app.input.trim().to_string();
                     if text.is_empty() {
                         continue;
                     }
+
                     if text == "/quit" {
-                        crypto.send_msg(&mut stream, b"/quit").ok();
+                        send_tx.send("/quit".to_string()).ok();
                         app.status = Status::Quit;
                         break;
                     }
-                    match crypto.send_msg(&mut stream, text.as_bytes()) {
-                        Ok(()) => {
-                            let msg = own_msg(app.my_name.clone(), text.clone());
-                            if let Some(h) = history.as_mut() {
-                                h.write_message(&msg.timestamp, &msg.sender, &msg.content);
-                            }
-                            app.push(msg);
+
+                    if send_tx.send(text.clone()).is_ok() {
+                        let msg = own_msg(app.my_name.clone(), text.clone());
+                        if let Some(h) = history.as_mut() {
+                            h.write_message(&msg.timestamp, &msg.sender, &msg.content);
                         }
-                        Err(_) => {
-                            app.push(system_msg("Failed to send — connection may be broken.".to_string()));
-                            app.status = Status::ConnectionLost;
-                        }
+                        app.push(msg);
+                    } else {
+                        app.push(system_msg(
+                            "Send failed — connection may be broken.".to_string(),
+                        ));
+                        app.status = Status::ConnectionLost;
                     }
+
                     app.input.clear();
                     app.cursor_pos = 0;
-                    app.scroll_offset = 0; // jump to latest after sending
+                    app.scroll_offset = 0;
                 }
 
-                // ── Exit ──────────────────────────────────────────────
                 KeyCode::Esc => {
-                    crypto.send_msg(&mut stream, b"/quit").ok();
+                    send_tx.send("/quit".to_string()).ok();
                     app.status = Status::Quit;
                     break;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    crypto.send_msg(&mut stream, b"/quit").ok();
+                    send_tx.send("/quit".to_string()).ok();
                     app.status = Status::Quit;
                     break;
                 }
 
-                // ── Typing ────────────────────────────────────────────
                 KeyCode::Char(c) => {
                     app.input.insert(app.cursor_pos, c);
                     app.cursor_pos += 1;
@@ -263,14 +307,9 @@ fn event_loop(
                         app.cursor_pos += 1;
                     }
                 }
-                KeyCode::Home => {
-                    app.cursor_pos = 0;
-                }
-                KeyCode::End => {
-                    app.cursor_pos = app.input.len();
-                }
+                KeyCode::Home => app.cursor_pos = 0,
+                KeyCode::End => app.cursor_pos = app.input.len(),
 
-                // ── Scroll ────────────────────────────────────────────
                 KeyCode::PageUp => app.scroll_up(5),
                 KeyCode::PageDown => app.scroll_down(5),
                 KeyCode::Up => app.scroll_up(1),
@@ -284,23 +323,32 @@ fn event_loop(
     Ok(())
 }
 
-// ─── Rendering ───────────────────────────────────────────────────────────────
+// ─── Rendering ────────────────────────────────────────────────────────────────
 
 fn render(f: &mut Frame<'_>, app: &App) {
     let area = f.size();
 
-    let chunks = Layout::default()
+    let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Min(1),    // messages
+            Constraint::Min(1),    // body
             Constraint::Length(3), // input
         ])
         .split(area);
 
-    render_header(f, app, chunks[0]);
-    render_messages(f, app, chunks[1]);
-    render_input(f, app, chunks[2]);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(1),     // messages
+            Constraint::Length(20), // online users
+        ])
+        .split(vertical[1]);
+
+    render_header(f, app, vertical[0]);
+    render_messages(f, app, body[0]);
+    render_users(f, app, body[1]);
+    render_input(f, app, vertical[2]);
 }
 
 fn render_header(f: &mut Frame<'_>, app: &App, area: Rect) {
@@ -311,32 +359,39 @@ fn render_header(f: &mut Frame<'_>, app: &App, area: Rect) {
         Status::Quit => ("Disconnecting…", Color::DarkGray),
     };
 
+    let n = app.online_users.len();
+    let user_count = if n == 1 {
+        "1 user".to_string()
+    } else {
+        format!("{n} users")
+    };
+
     let line = Line::from(vec![
         Span::styled(
-            format!("  LocalChat  ·  {} ↔ {}  ", app.my_name, app.peer_name),
+            format!("  LocalChat  ·  {}  ·  {}  ", app.my_name, app.room_label),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("·  {}", status_str),
+            format!("·  {}  ·  {}", status_str, user_count),
             Style::default()
                 .fg(status_color)
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
 
-    let header = Paragraph::new(line).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
+    f.render_widget(
+        Paragraph::new(line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue)),
+        ),
+        area,
     );
-
-    f.render_widget(header, area);
 }
 
 fn render_messages(f: &mut Frame<'_>, app: &App, area: Rect) {
-    // How many message rows fit inside the block (excluding top/bottom borders)
     let inner_height = area.height.saturating_sub(2) as usize;
 
     let total = app.messages.len();
@@ -346,26 +401,60 @@ fn render_messages(f: &mut Frame<'_>, app: &App, area: Rect) {
 
     let lines: Vec<Line<'_>> = visible.iter().map(format_msg).collect();
 
-    let scrolled = app.scroll_offset > 0;
-    let title = if scrolled {
-        format!(
-            " Messages  ↑ scrolled ({} newer) ↓ ",
-            app.scroll_offset
-        )
+    let title = if app.scroll_offset > 0 {
+        format!(" Messages  ↑ ({} newer) ", app.scroll_offset)
     } else {
         " Messages ".to_string()
     };
 
-    let para = Paragraph::new(Text::from(lines))
-        .block(
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title(title.as_str())
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Blue)),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_users(f: &mut Frame<'_>, app: &App, area: Rect) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+
+    let lines: Vec<Line<'_>> = app
+        .online_users
+        .iter()
+        .take(inner_height)
+        .map(|name| {
+            let is_self = name == &app.my_name;
+            let (icon, color) = if is_self {
+                ("▶ ", Color::Green)
+            } else {
+                ("● ", Color::Cyan)
+            };
+            Line::from(vec![
+                Span::styled(icon, Style::default().fg(color)),
+                Span::styled(
+                    name.as_str(),
+                    Style::default()
+                        .fg(color)
+                        .add_modifier(if is_self { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+            ])
+        })
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).block(
             Block::default()
-                .title(title.as_str())
+                .title(format!(" Online ({}) ", app.online_users.len()).as_str())
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
-        )
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(para, area);
+        ),
+        area,
+    );
 }
 
 fn render_input(f: &mut Frame<'_>, app: &App, area: Rect) {
@@ -377,26 +466,29 @@ fn render_input(f: &mut Frame<'_>, app: &App, area: Rect) {
     let prefix = "> ";
     let display = format!("{}{}", prefix, app.input);
 
-    let input_style = if app.status == Status::Connected {
-        Style::default().fg(Color::Yellow)
+    let border_color = if app.status == Status::Connected {
+        Color::Cyan
     } else {
-        Style::default().fg(Color::DarkGray)
+        Color::DarkGray
+    };
+    let text_color = if app.status == Status::Connected {
+        Color::Yellow
+    } else {
+        Color::DarkGray
     };
 
-    let widget = Paragraph::new(display.as_str()).block(
-        Block::default()
-            .title(hint)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if app.status == Status::Connected {
-                Color::Cyan
-            } else {
-                Color::DarkGray
-            })),
-    ).style(input_style);
+    f.render_widget(
+        Paragraph::new(display.as_str())
+            .block(
+                Block::default()
+                    .title(hint)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border_color)),
+            )
+            .style(Style::default().fg(text_color)),
+        area,
+    );
 
-    f.render_widget(widget, area);
-
-    // Place the cursor inside the input box
     if app.status == Status::Connected {
         f.set_cursor(
             area.x + 1 + prefix.len() as u16 + app.cursor_pos as u16,
@@ -440,7 +532,7 @@ fn format_msg(msg: &ChatMessage) -> Line<'_> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn system_msg(content: String) -> ChatMessage {
+pub fn system_msg(content: String) -> ChatMessage {
     ChatMessage {
         timestamp: Local::now().format("%H:%M:%S").to_string(),
         sender: String::new(),
@@ -450,7 +542,7 @@ fn system_msg(content: String) -> ChatMessage {
     }
 }
 
-fn own_msg(sender: String, content: String) -> ChatMessage {
+pub fn own_msg(sender: String, content: String) -> ChatMessage {
     ChatMessage {
         timestamp: Local::now().format("%H:%M:%S").to_string(),
         sender,
@@ -460,8 +552,6 @@ fn own_msg(sender: String, content: String) -> ChatMessage {
     }
 }
 
-/// Fires a desktop notification via `notify-send` (available on all Linux desktops).
-/// Silently ignores failures (e.g. when running headless).
 fn send_desktop_notification(sender: &str, content: &str) {
     let _ = std::process::Command::new("notify-send")
         .args([
